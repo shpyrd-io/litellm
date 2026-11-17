@@ -1,5 +1,5 @@
 #!/bin/sh
-# The door in front of LiteLLM on shpyrd.
+# The start of LiteLLM on shpyrd.
 #
 # The catalog generates two values at install, MASTER_KEY_SEED and
 # SALT_KEY_SEED: random bytes as hex. LiteLLM wants its master key to
@@ -30,10 +30,12 @@ if [ -z "${DATABASE_URL:-}" ]; then
   exit 1
 fi
 
-# No arguments: the proxy, on the port the platform gave. Arguments are
-# passed on as they are (a one-off command, another component).
+# No arguments: the door, which listens on the port the platform gave and
+# runs the proxy behind itself. Arguments are passed on to LiteLLM as they
+# are (a one-off command, another component), without the door.
 if [ "$#" -eq 0 ]; then
-  set -- --port "${PORT:-4000}"
+  export PORT="${PORT:-4000}"
+  exec /usr/local/bin/litellm-door
 fi
 
 exec /app/docker/prod_entrypoint.sh "$@"
