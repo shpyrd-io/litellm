@@ -15,8 +15,8 @@ UI.
 ## What the person sees
 
 1. The project is installed from the catalog. The install asks the admin
-   user's name and password, and creates a Postgres database for the
-   project.
+   user's name, generates its password (kept in the project's secrets as
+   `UI_PASSWORD`), and creates a Postgres database for the project.
 2. The project's access is set to **Named people** (`identified`), once:
    `shpyrd access set identified --project litellm`. See "Access" below
    for why.
@@ -37,8 +37,9 @@ install).
 
 Everyone else sees LiteLLM's own login: people with another role,
 anyone the platform has not identified, and an "Open as" preview, which is
-never signed in whatever roles it shows. The user and password given at
-install still work on that screen, for anyone who has them.
+never signed in whatever roles it shows. The install user and the
+generated password, `UI_PASSWORD` in the project's secrets, still work on
+that screen, for anyone who has them.
 
 Things to know:
 
@@ -72,8 +73,8 @@ is `identified` (public, signed-in visitors identified). With the default,
 talk to its own API; with `public`, the header is blanked.
 
 So the project is open to the internet and LiteLLM's keys are what
-protect it. Choose a strong admin password, and give each application a
-virtual key of its own.
+protect it. Keep the generated admin password to the people who need
+it, and give each application a virtual key of its own.
 
 Another project of the workspace calls LiteLLM at its public address, not
 at `http://litellm.internal`: on an internal call the platform puts the
