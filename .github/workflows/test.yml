@@ -1,0 +1,154 @@
+name: test
+on:
+  push:
+  pull_request:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: false
+      - run: go vet ./...
+      - run: go test ./...
+
+  # The real thing: the image built from the Dockerfile, started with a
+  # Postgres, signed in to by the program's own login, and the session
+  # accepted by LiteLLM.
+  container:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      IMAGE: litellm-door-ci
+      MASTER_KEY_SEED: 0123456789abcdef0123456789abcdef
+      SALT_KEY_SEED: fedcba9876543210fedcba9876543210
+      UI_USERNAME: admin
+      UI_PASSWORD: ci-admin-password-7f3a
+      DATABASE_URL: postgresql://postgres:ci@127.0.0.1:5432/postgres
+      ISSUER: http://127.0.0.1:8099
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build the image
+        run: docker build --tag "$IMAGE" .
+
+      - name: The entrypoint keeps its contract
+        run: |
+          set -u
+          [ "$(docker run --rm --entrypoint id "$IMAGE" -u)" = 65534 ]
+
+          # No seed, then no database: a sentence on stderr and a non-zero exit.
+          if docker run --rm -e DATABASE_URL=x "$IMAGE" 2>err.txt; then echo "started without a master key"; exit 1; fi
+          grep -q "master key" err.txt
+          if docker run --rm -e MASTER_KEY_SEED=aa -e SALT_KEY_SEED=bb "$IMAGE" 2>err.txt; then echo "started without a database"; exit 1; fi
+          grep -q "needs a database" err.txt
+
+      - name: Start Postgres and the platform's keys
+        run: |
+          docker run -d --name pg --network host -e POSTGRES_PASSWORD=ci postgres:16
+          for i in $(seq 1 30); do docker exec pg pg_isready -U postgres && break; sleep 1; done
+
+          b64url() { openssl base64 -A | tr '+/' '-_' | tr -d '='; }
+          openssl genpkey -algorithm ed25519 -out key.pem
+          x=$(openssl pkey -in key.pem -pubout -outform DER | tail -c 32 | b64url)
+          mkdir -p jwks/.well-known
+          printf '{"keys":[{"kty":"OKP","crv":"Ed25519","alg":"EdDSA","use":"sig","kid":"ci","x":"%s"}]}' "$x" > jwks/.well-known/jwks.json
+          nohup python3 -m http.server 8099 --bind 127.0.0.1 --directory jwks >/dev/null 2>&1 &
+
+      - name: Start LiteLLM behind the door
+        run: |
+          docker run -d --name litellm --network host \
+            -e PORT=4000 -e DATABASE_URL -e MASTER_KEY_SEED -e SALT_KEY_SEED \
+            -e UI_USERNAME -e UI_PASSWORD \
+            -e SHPYRD_ISSUER="$ISSUER" -e SHPYRD_PROJECT=litellm \
+            "$IMAGE"
+          # Until LiteLLM answers, the door answers 503 and never 200.
+          for i in $(seq 1 180); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' localhost:4000/health/liveliness || true)
+            echo "answer: $code"
+            [ "$code" = 200 ] && exit 0
+            case "$code" in 000|503) ;; *) echo "neither 503 nor 200"; docker logs litellm; exit 1 ;; esac
+            sleep 2
+          done
+          docker logs litellm
+          exit 1
+
+      - name: API traffic passes, the UI without an identity is LiteLLM's own
+        run: |
+          set -u
+          [ "$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer sk-$MASTER_KEY_SEED" localhost:4000/v1/models)" = 200 ]
+          [ "$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer sk-wrong" localhost:4000/v1/models)" = 401 ]
+          curl -s -D headers.txt -o ui.html -H "Accept: text/html" localhost:4000/ui/
+          head -1 headers.txt | grep -q 200
+          if grep -qi '^set-cookie: token=' headers.txt; then echo "signed in without an identity"; exit 1; fi
+
+      - name: The door signs in an admin, and LiteLLM accepts the session
+        run: |
+          set -u
+          b64url() { openssl base64 -A | tr '+/' '-_' | tr -d '='; }
+          mint() {
+            h=$(printf '%s' '{"alg":"EdDSA","kid":"ci","typ":"JWT"}' | b64url)
+            p=$(printf '%s' "$1" | b64url)
+            printf '%s' "$h.$p" > signing-input
+            s=$(openssl pkeyutl -sign -inkey key.pem -rawin -in signing-input | b64url)
+            printf '%s' "$h.$p.$s"
+          }
+          exp=$(( $(date +%s) + 300 ))
+          claims() { printf '{"iss":"%s","aud":"%s","sub":"idn_ci","ws":"default","project":"litellm","roles":%s,"teams":[],"realm":"workspace","preview":%s,"exp":%s}' "$ISSUER" "$1" "$2" "$3" "$exp"; }
+
+          # A person with the admin role: signed in, to the page they asked for.
+          admin=$(mint "$(claims litellm '["admin"]' false)")
+          curl -s -D headers.txt -o /dev/null -H "Accept: text/html" -H "Authorization: Bearer $admin" localhost:4000/ui/
+          head -1 headers.txt | grep -q 303
+          grep -qi '^location: /ui/' headers.txt
+          grep -qi '^cache-control: no-store' headers.txt
+          session=$(grep -i '^set-cookie: token=' headers.txt | sed -e 's/^[^=]*=//' -e 's/;.*//' | tr -d '\r')
+          [ -n "$session" ]
+          if grep -q "$UI_PASSWORD" headers.txt; then echo "the password reached the browser"; exit 1; fi
+
+          # What the dashboard does with the cookie: it takes the "key" claim
+          # of the session's JWT and calls the API with that as the bearer.
+          payload=$(printf '%s' "$session" | cut -d. -f2 | tr '_-' '/+')
+          while [ $(( ${#payload} % 4 )) -ne 0 ]; do payload="$payload="; done
+          key=$(printf '%s' "$payload" | base64 -d | grep -o '"key":"[^"]*"' | cut -d'"' -f4)
+          case "$key" in sk-*) ;; *) echo "the session carries no key"; exit 1 ;; esac
+          [ "$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $key" localhost:4000/user/info)" = 200 ]
+          [ "$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $key" localhost:4000/key/list)" = 200 ]
+          [ "$(curl -s -o /dev/null -w '%{http_code}' localhost:4000/user/info)" != 200 ]
+
+          # Not signed in: another role, a preview, a token of another project.
+          for c in "$(claims litellm '["viewer"]' false)" "$(claims litellm '["admin"]' true)" "$(claims other '["admin"]' false)"; do
+            curl -s -D headers.txt -o /dev/null -H "Accept: text/html" -H "Authorization: Bearer $(mint "$c")" localhost:4000/ui/
+            if grep -qi '^set-cookie: token=' headers.txt; then echo "signed in: $c"; exit 1; fi
+          done
+
+      - name: When LiteLLM ends, the container ends
+        run: |
+          # The LiteLLM process is the one on port 4001: end it from inside.
+          docker exec litellm sh -c 'for d in /proc/[0-9]*; do if tr "\0" " " < "$d/cmdline" 2>/dev/null | grep -q -- "--port 400[1]"; then kill "${d#/proc/}"; fi; done'
+          code=$(timeout 60 docker wait litellm)
+          echo "exit status $code"
+          [ "$code" != 0 ]
+
+      - name: Without the platform's keys the UI is LiteLLM's own, and a stop is quick
+        run: |
+          docker rm -f litellm
+          docker run -d --name litellm --network host \
+            -e PORT=4000 -e DATABASE_URL -e MASTER_KEY_SEED -e SALT_KEY_SEED "$IMAGE"
+          for i in $(seq 1 180); do
+            [ "$(curl -s -o /dev/null -w '%{http_code}' localhost:4000/health/liveliness || true)" = 200 ] && break
+            sleep 2
+          done
+          curl -s -i -H "Accept: text/html" localhost:4000/ui/ > ui.txt
+          head -1 ui.txt | grep -q 200
+          if grep -qi '^set-cookie: token=' ui.txt; then echo "signed in without keys"; exit 1; fi
+          start=$(date +%s)
+          docker stop litellm
+          took=$(( $(date +%s) - start ))
+          echo "stopped in ${took}s"
+          [ "$took" -lt 10 ]
+
+      - if: failure()
+        run: docker logs litellm || true

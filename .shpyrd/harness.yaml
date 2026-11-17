@@ -1,2 +1,7 @@
 prefix: litellm
 visibility: public
+verify:
+  static:
+    - "go vet ./..."
+  test:
+    - "go test ./..."
