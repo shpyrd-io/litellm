@@ -31,7 +31,8 @@ to its root.
 | `litellm/proxy/auth/login_utils.py` | `authenticate_user`, `get_ui_credentials`, `encode_ui_session_jwt`: who the default admin is, the session's lifetime |
 | `litellm/proxy/auth/ip_address_utils.py` | `is_request_https`: when the cookie is marked `Secure` |
 | `litellm/proxy/common_utils/html_forms/ui_login.py` | the login form: field names and where it posts |
-| `ui/litellm-dashboard/src/utils/cookieUtils.ts` | what the dashboard does with the cookie |
+| `ui/litellm-dashboard/src/app/(dashboard)/hooks/useAuthorized.ts` | what the dashboard reads from the cookie: the `exp` and the `key` claim it uses as the API bearer |
+| `ui/litellm-dashboard/src/utils/cookieUtils.ts` | how the cookie is read and cleared |
 
 ## The login
 
@@ -62,7 +63,7 @@ to its root.
 
 - **One cookie:** `token`.
 - **Value:** a JWT signed HS256 with the master key. Its claims are the
-  session's user and `exp`, the session's end:
+  session's user, the session's virtual `key` and `exp`, the session's end:
   `LITELLM_UI_SESSION_DURATION` from the login, 24 hours by default.
 - **Attributes:** `Path=/`, `SameSite=lax`, not `HttpOnly` (the dashboard
   reads it from `document.cookie`), no `Max-Age` or `Expires` (a browser
@@ -76,13 +77,25 @@ to its root.
 ## What the UI reads
 
 The admin UI is a static Next.js export, served from `/ui`. Its pages
-decide in the browser: the dashboard reads the `token` cookie, decodes it,
-and treats a missing or expired one (`exp`) as signed out, sending the
-person to its login page under `/ui`. With a good cookie it calls the API
-with `Authorization: Bearer <that token>`. Nothing is read from the
-redirect's `?login=success`. So a navigation that arrives with the cookie
-is the UI signed in, and the server-side login only has to put the cookie
-in the browser.
+decide in the browser (`src/app/(dashboard)/hooks/useAuthorized.ts`, with
+`src/utils/cookieUtils.ts` and `src/utils/jwtUtils.ts`): the dashboard
+reads the `token` cookie, decodes the JWT, and treats a missing or expired
+one (`exp`) as signed out, sending the person to its login page under
+`/ui`.
+
+The cookie itself is not the credential for the API. The JWT carries a
+`key` claim, a virtual key (`sk-...`) minted for the session at login, and
+the dashboard uses that claim as its access token: it calls the API with
+`Authorization: Bearer <the key claim>` (the header name is the
+`auth_header_name` claim, `Authorization` by default). Sending the whole
+cookie JWT as the bearer is refused by LiteLLM with a 401 ("Virtual Key
+expected"). The other claims it reads are `user_id`, `user_role`,
+`login_method`, `premium_user`, `auth_header_name`,
+`disabled_non_admin_personal_key_creation` and `password_reset_required`.
+Nothing is read from the redirect's `?login=success`. So a navigation that
+arrives with the cookie is the UI signed in, and the server-side login only
+has to put the cookie in the browser; the proof that LiteLLM accepts the
+session is a call made with the cookie's `key` claim.
 
 ## How the door uses it
 

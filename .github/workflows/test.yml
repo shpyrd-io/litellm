@@ -108,8 +108,14 @@ jobs:
           [ -n "$session" ]
           if grep -q "$UI_PASSWORD" headers.txt; then echo "the password reached the browser"; exit 1; fi
 
-          # What the dashboard does with the cookie: call the API with it.
-          [ "$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $session" localhost:4000/user/info)" = 200 ]
+          # What the dashboard does with the cookie: it takes the "key" claim
+          # of the session's JWT and calls the API with that as the bearer.
+          payload=$(printf '%s' "$session" | cut -d. -f2 | tr '_-' '/+')
+          while [ $(( ${#payload} % 4 )) -ne 0 ]; do payload="$payload="; done
+          key=$(printf '%s' "$payload" | base64 -d | grep -o '"key":"[^"]*"' | cut -d'"' -f4)
+          case "$key" in sk-*) ;; *) echo "the session carries no key"; exit 1 ;; esac
+          [ "$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $key" localhost:4000/user/info)" = 200 ]
+          [ "$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $key" localhost:4000/key/list)" = 200 ]
           [ "$(curl -s -o /dev/null -w '%{http_code}' localhost:4000/user/info)" != 200 ]
 
           # Not signed in: another role, a preview, a token of another project.
